@@ -48,51 +48,42 @@ async def call_claude(prompt: str, max_tokens: int = 4000, plain_text: bool = Fa
 
     last_err = None
     for model in MODELS:
-        # Tenta primeiro COM web search, depois SEM se der 400
-        for use_search in [True, False]:
-            body = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            if use_search:
-                body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+        body = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=90) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers, json=body,
+                )
+                if resp.status_code in (404, 529):
+                    last_err = f"{model}: {resp.status_code}"
+                    logger.warning(last_err)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                logger.info(f"✅ Sucesso com modelo: {model}")
 
-            try:
-                async with httpx.AsyncClient(timeout=90) as client:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers, json=body,
-                    )
+                text = "".join(
+                    b.get("text","") for b in data.get("content",[])
+                    if b.get("type") == "text"
+                )
+                if plain_text:
+                    return text.strip()
 
-                    if resp.status_code in (400, 404):
-                        err_body = resp.json() if resp.headers.get("content-type","").startswith("application/json") else {}
-                        last_err = f"{model} {'c/search' if use_search else 's/search'}: {resp.status_code} {err_body.get('error',{}).get('message','')}"
-                        logger.warning(last_err)
-                        break  # tenta sem search neste model
+                m = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
+                if not m:
+                    raise HTTPException(502, f"IA não retornou JSON. Texto: {text[:300]}")
+                return json.loads(m.group(0))
 
-                    resp.raise_for_status()
-                    data = resp.json()
-                    logger.info(f"✅ {model} {'c/search' if use_search else 's/search'}")
-
-                    text = "".join(
-                        b.get("text","") for b in data.get("content",[])
-                        if b.get("type") == "text"
-                    )
-
-                    if plain_text:
-                        return text.strip()
-
-                    m = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
-                    if not m:
-                        raise HTTPException(502, f"IA não retornou JSON. Texto: {text[:300]}")
-                    return json.loads(m.group(0))
-
-            except httpx.HTTPStatusError as e:
-                last_err = f"{model}: HTTP {e.response.status_code}"
-                logger.error(last_err)
-                if e.response.status_code not in (400, 404, 529):
-                    raise HTTPException(502, last_err)
+        except httpx.HTTPStatusError as e:
+            last_err = f"{model}: HTTP {e.response.status_code} — {e.response.text[:200]}"
+            logger.error(last_err)
+            if e.response.status_code not in (404, 529):
+                raise HTTPException(502, last_err)
 
     raise HTTPException(502, f"Nenhum modelo funcionou. Último erro: {last_err}")
 
